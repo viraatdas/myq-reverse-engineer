@@ -1,0 +1,33 @@
+# MyQ Garage Door Controller
+# Docker Compose configuration
+
+services:
+  # Main API server
+  api:
+    build: .
+    container_name: myq-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./myq_tokens.json:/app/myq_tokens.json
+      - ./.env:/app/.env:ro
+    environment:
+      - TZ=America/New_York  # Change to your timezone
+    restart: unless-stopped
+    command: python server.py
+
+  # Token capture proxy (optional - run with: docker compose --profile capture up)
+  capture:
+    build: .
+    container_name: myq-capture
+    ports:
+      - "8888:8888"  # Proxy port - configure your phone to use this
+      - "8889:8889"  # Status page - visit for setup instructions
+    volumes:
+      - ./myq_tokens.json:/app/myq_tokens.json
+    environment:
+      - TZ=America/New_York
+    restart: unless-stopped
+    profiles:
+      - capture
+    command: python auto_capture_proxy.py

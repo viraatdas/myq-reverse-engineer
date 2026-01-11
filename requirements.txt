@@ -1,0 +1,17 @@
+# MyQ Garage Door Controller Dependencies
+
+# Web framework
+fastapi>=0.115.0
+uvicorn>=0.32.0
+
+# HTTP client for MyQ API
+aiohttp>=3.11.0
+
+# Environment configuration
+python-dotenv>=1.0.0
+
+# HTML parsing (for token capture)
+beautifulsoup4>=4.12.0
+
+# Proxy for token capture (optional)
+mitmproxy>=11.0.0

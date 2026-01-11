@@ -1,0 +1,71 @@
+# Environment and secrets
+.env
+.env.local
+.env.production
+deploy_config.sh
+
+# Token files (contain sensitive auth data)
+myq_tokens.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+.venv/
+ENV/
+
+# UV package manager
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Screenshots from debugging
+*.png
+
+# APK files (large binary files)
+*.apk
+*.xapk
+apk_extract/
+
+# Node.js test files (development only)
+node-test/
+node_modules/
+
+# Mitmproxy certificates (generated locally)
+~/.mitmproxy/
+
+# Local development files
+*.local
+*.bak
+

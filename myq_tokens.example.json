@@ -1,0 +1,12 @@
+{
+  "access_token": "YOUR_ACCESS_TOKEN_HERE",
+  "refresh_token": "YOUR_REFRESH_TOKEN_HERE",
+  "expires_at": 0,
+  "expires_in": 1800,
+  "token_type": "Bearer",
+  "scope": "MyQ_Residential offline_access",
+  "account_id": "YOUR_ACCOUNT_ID",
+  "device_serial": "YOUR_DEVICE_SERIAL",
+  "cf_cookie": "YOUR_CLOUDFLARE_COOKIE"
+}
+

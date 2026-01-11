@@ -1,0 +1,31 @@
+# Ignore sensitive files
+.env
+.env.*
+!.env.example
+myq_tokens.json
+deploy_config.sh
+
+# Ignore development files
+__pycache__/
+*.py[cod]
+*.egg-info/
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Ignore test files
+node-test/
+*.png
+*.apk
+*.xapk
+apk_extract/
+
+# Ignore documentation (not needed in container)
+*.md
+LICENSE
+
+# Ignore UV files
+uv.lock
+.venv/
+
