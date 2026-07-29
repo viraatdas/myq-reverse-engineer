@@ -31,10 +31,34 @@ def _ssm_store():
     return SSMTokenStore(settings.ssm_parameter, settings.aws_region)
 
 
-def cmd_login(_args) -> int:
-    from .login import interactive_login
+def cmd_login(args) -> int:
+    """Log in, headlessly by default and via the browser on request."""
+    from .login import InvalidCredentials, LoginBlocked, automatic_login, interactive_login
 
-    tokens = interactive_login(_file_store())
+    settings = get_settings()
+    store = _file_store()
+
+    if getattr(args, "browser", False):
+        tokens = interactive_login(store)
+    else:
+        try:
+            tokens = automatic_login(settings.myq_email, settings.myq_password, store)
+        except InvalidCredentials as exc:
+            # Wrong password is worth stating plainly — falling back to the
+            # browser would just fail again, more slowly.
+            print(f"\n{exc.message}", file=sys.stderr)
+            print(
+                "\nCheck MYQ_EMAIL and MYQ_PASSWORD in .env. If you can sign in at\n"
+                "https://account.myq-cloud.com but not here, run:\n"
+                "    python -m myq.cli login --browser",
+                file=sys.stderr,
+            )
+            return 1
+        except LoginBlocked as exc:
+            print(f"\n{exc.message}", file=sys.stderr)
+            print("\nFalling back to browser login...\n")
+            tokens = interactive_login(store)
+
     print()
     print("Login successful. Tokens saved locally.")
     print(f"  account_id:    {tokens.account_id}")
@@ -153,8 +177,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="myq", description="MyQ garage door controller")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("setup", help="Log in and upload tokens to AWS (first-run)").set_defaults(fn=cmd_setup)
-    sub.add_parser("login", help="Interactive browser login").set_defaults(fn=cmd_login)
+    p_setup = sub.add_parser("setup", help="Log in and upload tokens to AWS (first-run)")
+    p_setup.add_argument("--browser", action="store_true", help="Use the browser flow")
+    p_setup.set_defaults(fn=cmd_setup)
+
+    p_login = sub.add_parser("login", help="Log in to MyQ and save tokens locally")
+    p_login.add_argument(
+        "--browser",
+        action="store_true",
+        help="Sign in via a real browser (needed for MFA/SSO accounts)",
+    )
+    p_login.set_defaults(fn=cmd_login)
     sub.add_parser("status", help="Show stored token state").set_defaults(fn=cmd_status)
     sub.add_parser("push-tokens", help="Upload local tokens to SSM").set_defaults(fn=cmd_push_tokens)
     sub.add_parser("pull-tokens", help="Download tokens from SSM").set_defaults(fn=cmd_pull_tokens)

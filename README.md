@@ -67,11 +67,17 @@ It prints your API URL at the end. Save it — you'll need it for Shortcuts.
 python -m myq.cli setup
 ```
 
-This opens the MyQ sign-in page in your browser, waits for you to log in, then uploads the resulting tokens to AWS.
-
-**This step needs a real browser and cannot be automated.** MyQ puts Cloudflare in front of its login page, which blocks headless browsers. You log in normally; the browser then fails to open a `com.myqops://android?code=...` link — that failure is expected, and you paste that URL back into the terminal.
+This signs in using the `MYQ_EMAIL` / `MYQ_PASSWORD` from your `.env`, then uploads the resulting tokens to AWS. No browser, no copy-paste.
 
 You only do this once. After that the API refreshes its own tokens indefinitely.
+
+If your account uses two-factor auth or federated sign-in, the automatic flow will say so and you can use the browser fallback:
+
+```bash
+python -m myq.cli setup --browser
+```
+
+That opens the MyQ sign-in page, you log in, and the browser then fails to open a `com.myqops://android?code=...` link — that failure is expected, and you paste that URL back into the terminal. Do it promptly: MyQ expires authorization codes in about a minute.
 
 ### 5. Verify
 
@@ -165,7 +171,7 @@ pytest                      # test suite, no network required
 | Command | Description |
 |---|---|
 | `myq setup` | Log in and upload tokens to AWS (first run) |
-| `myq login` | Browser login, saves tokens locally |
+| `myq login` | Log in, saves tokens locally (`--browser` for MFA/SSO accounts) |
 | `myq push-tokens` | Upload local tokens to SSM |
 | `myq pull-tokens` | Download tokens from SSM |
 | `myq status` | Show stored token state |
@@ -203,6 +209,10 @@ tests/               Test suite
 ## Troubleshooting
 
 **`503 MyQ authentication expired`** — the refresh token died (happens if you change your MyQ password or revoke sessions). Run `python -m myq.cli setup` again.
+
+**`MyQ rejected your email or password`** — the credentials in `.env` are wrong. Confirm them at [account.myq-cloud.com](https://account.myq-cloud.com) first; the API reports MyQ's own message verbatim.
+
+**`MyQ rejected the authorization code` / `401.122`** — despite reading like a client-authentication failure, this means MyQ would not honour the authorization code, usually because it expired. Codes last about a minute. Use the automatic login rather than pasting a URL by hand. Do *not* "fix" it by adding a client secret — the Android client does not send one.
 
 **`409 The garage door opener is offline`** — the opener has lost its Wi-Fi link to MyQ. Check the MyQ app; commands sent while offline do nothing.
 

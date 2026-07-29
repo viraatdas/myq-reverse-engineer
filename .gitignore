@@ -78,3 +78,6 @@ RUDDER_SHARED.md
 .build/
 *.local.md
 myq_tokens.tmp
+
+# Rudder agent bookkeeping (records live endpoint + account ids)
+DECISIONS.md
