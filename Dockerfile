@@ -1,36 +1,25 @@
-# MyQ Garage Door Controller
-# Docker image for the MyQ API server
+# Self-hosting image (Raspberry Pi, NAS, VPS).
+# The primary deployment target is AWS Lambda — see deploy/deploy.sh.
 
 FROM python:3.13-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# uvicorn is not a Lambda dependency, so it is installed explicitly here.
+RUN pip install --no-cache-dir -r requirements.txt "uvicorn>=0.32"
 
-# Copy application code (exclude sensitive files via .dockerignore)
-COPY server.py .
-COPY myq_api.py .
-COPY auto_capture_proxy.py .
+COPY myq ./myq
 
-# Create placeholder for tokens (will be mounted as volume)
+# Placeholder; mount a real token file over this.
 RUN echo '{}' > myq_tokens.json
 
-# Expose ports
-# 8000 = API server
-# 8888 = Token capture proxy
-# 8889 = Capture status page
-EXPOSE 8000 8888 8889
+EXPOSE 8000
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Default command runs the API server
-CMD ["python", "server.py"]
+CMD ["python", "-m", "uvicorn", "myq.api:app", "--host", "0.0.0.0", "--port", "8000"]

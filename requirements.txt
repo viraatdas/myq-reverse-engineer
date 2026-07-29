@@ -1,17 +1,8 @@
-# MyQ Garage Door Controller Dependencies
+# Runtime dependencies for the Lambda bundle.
+# boto3 is intentionally omitted: the AWS Lambda Python runtime provides it.
+# For local development use `pip install -e .[dev]` instead.
 
-# Web framework
-fastapi>=0.115.0
-uvicorn>=0.32.0
-
-# HTTP client for MyQ API
-aiohttp>=3.11.0
-
-# Environment configuration
-python-dotenv>=1.0.0
-
-# HTML parsing (for token capture)
-beautifulsoup4>=4.12.0
-
-# Proxy for token capture (optional)
-mitmproxy>=11.0.0
+aiohttp>=3.10
+fastapi>=0.115
+mangum>=0.19
+pydantic-settings>=2.6

@@ -1,8 +1,11 @@
-# MyQ Garage Door Controller
-# Docker Compose configuration
+# Self-hosting compose file. The primary deployment is AWS Lambda
+# (deploy/deploy.sh); use this only if you would rather run it yourself.
+#
+# Note: behind Docker the API is plain HTTP. Put it behind a reverse proxy with
+# TLS (Caddy, nginx) before exposing it to the internet — iOS Shortcuts should
+# not be sending your API key over an unencrypted connection.
 
 services:
-  # Main API server
   api:
     build: .
     container_name: myq-api
@@ -12,22 +15,5 @@ services:
       - ./myq_tokens.json:/app/myq_tokens.json
       - ./.env:/app/.env:ro
     environment:
-      - TZ=America/New_York  # Change to your timezone
-    restart: unless-stopped
-    command: python server.py
-
-  # Token capture proxy (optional - run with: docker compose --profile capture up)
-  capture:
-    build: .
-    container_name: myq-capture
-    ports:
-      - "8888:8888"  # Proxy port - configure your phone to use this
-      - "8889:8889"  # Status page - visit for setup instructions
-    volumes:
-      - ./myq_tokens.json:/app/myq_tokens.json
-    environment:
       - TZ=America/New_York
     restart: unless-stopped
-    profiles:
-      - capture
-    command: python auto_capture_proxy.py

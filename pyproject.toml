@@ -1,23 +1,46 @@
 [project]
 name = "myq-garage-api"
-version = "0.1.0"
-description = "Control your MyQ garage door from Apple Shortcuts via REST API"
+version = "3.0.0"
+description = "Control a MyQ garage door from iOS Shortcuts via a REST API on AWS Lambda"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
+
+# Runtime dependencies. These are exactly what ships in the Lambda bundle —
+# boto3 is deliberately absent because the Lambda runtime already provides it.
 dependencies = [
-    "aiohttp>=3.13.3",
-    "beautifulsoup4>=4.14.3",
-    "brotli>=1.2.0",
-    "fastapi>=0.128.0",
-    "httpx>=0.28.1",
-    "mitmproxy>=12.2.1",
-    "playwright>=1.57.0",
-    "pydantic-settings>=2.12.0",
-    "pymyq>=3.1.6",
-    "python-dotenv>=1.2.1",
-    "requests>=2.32.5",
-    "selenium>=4.39.0",
-    "setuptools>=80.9.0",
-    "undetected-chromedriver>=3.5.5",
-    "uvicorn>=0.40.0",
+    "aiohttp>=3.10",
+    "fastapi>=0.115",
+    "mangum>=0.19",
+    "pydantic-settings>=2.6",
 ]
+
+[project.optional-dependencies]
+# Needed on a workstation for the login flow and running the server locally.
+local = [
+    "httpx>=0.28",
+    "uvicorn>=0.32",
+    "boto3>=1.35",
+]
+dev = [
+    "httpx>=0.28",
+    "uvicorn>=0.32",
+    "boto3>=1.35",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+# Optional mitmproxy-based token capture (tools/capture_proxy.py).
+capture = ["mitmproxy>=11.0"]
+
+[project.scripts]
+myq = "myq.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["myq"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

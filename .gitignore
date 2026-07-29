@@ -73,3 +73,8 @@ node_modules/
 .rudder-worktrees/
 RUDDER.md
 RUDDER_SHARED.md
+
+# Build artifacts and local-only notes
+.build/
+*.local.md
+myq_tokens.tmp

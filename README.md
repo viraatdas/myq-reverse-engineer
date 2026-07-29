@@ -1,234 +1,226 @@
 # MyQ Garage Door Controller
 
-A self-hosted REST API to control your MyQ garage door, with support for iOS Shortcuts automation.
+A self-hosted REST API for controlling a MyQ garage door, designed for iOS Shortcuts automation and deployed to AWS Lambda.
 
-**Why this exists:** MyQ removed their official API and blocks third-party integrations. This project reverse-engineers the MyQ mobile app's API to provide reliable garage door control.
+**Why this exists:** Chamberlain shut off third-party access to MyQ and blocks unofficial API clients. This project reverse-engineers the MyQ Android app's OAuth flow and device API to give you back programmatic control of your own garage door.
+
+```
+┌──────────────┐    HTTPS     ┌─────────────┐   OAuth 2.0   ┌─────────────┐
+│  iOS         │─────────────▶│ API Gateway │──────────────▶│  MyQ Cloud  │
+│  Shortcuts   │  X-API-Key   │  + Lambda   │  Bearer token │     API     │
+└──────────────┘              └──────┬──────┘               └─────────────┘
+                                     │
+                             ┌───────▼────────┐
+                             │ SSM Parameter  │  rotating tokens,
+                             │ Store (KMS)    │  encrypted at rest
+                             └────────────────┘
+```
 
 ## Features
 
-- 🚗 **REST API** - Simple endpoints to open, close, and check door status
-- 🔄 **Auto Token Refresh** - Tokens automatically refresh, no manual intervention needed
-- 📱 **iOS Shortcuts Support** - Automate with Bluetooth triggers (e.g., Tesla connection)
-- 🐳 **Docker Ready** - One-command deployment
-- 🔒 **Secure** - Optional API key protection
+- **Built for Shortcuts** — every command works over plain `GET`, authenticates via a query parameter, and can return plain text instead of JSON
+- **Confirmed commands** — `?wait=true` polls until the door has actually finished moving, so an automation can report what happened rather than what was requested
+- **Durable tokens** — MyQ access tokens expire every ~30 minutes; refreshed tokens are written back to SSM Parameter Store so they survive restarts and cold starts
+- **Fails closed** — no API key configured means the API refuses requests rather than exposing an open garage door
+- **~$0/month** — Lambda + API Gateway at garage-door request volumes sits inside the free tier
+- **Idempotent** — closing an already-closed door is a no-op, because Shortcuts automations fire more than once
 
-## Quick Start
+## Quick start
 
-### Prerequisites
-
-- Docker & Docker Compose
-- A MyQ account with a compatible garage door opener
-- iPhone with Proxyman app (for initial token capture)
-
-### 1. Clone and Configure
+### 1. Install
 
 ```bash
-git clone https://github.com/yourusername/myq-controller.git
-cd myq-controller
+git clone https://github.com/viraatdas/myq-reverse-engineer.git
+cd myq-reverse-engineer
+uv venv && uv pip install -e ".[dev]"
+```
 
-# Create configuration files
+### 2. Configure
+
+```bash
 cp .env.example .env
-cp myq_tokens.example.json myq_tokens.json
-
-# Edit .env and set your API_KEY
-nano .env
+python -c "import secrets; print('API_KEY=' + secrets.token_urlsafe(32))" >> .env
 ```
 
-### 2. Capture Tokens (One-Time Setup)
+Set `MYQ_EMAIL` and `MYQ_PASSWORD` in `.env` too — they are used only by the one-time login below, never by the deployed API.
 
-Since MyQ blocks automated logins with Cloudflare, you'll need to capture tokens from the official app:
-
-1. **Install [Proxyman](https://apps.apple.com/app/proxyman/id1551292695)** on your iPhone (free)
-2. Open Proxyman → Enable SSL Proxying for `*.myq-cloud.com`
-3. Open the **MyQ app** → Log out → Log back in
-4. In Proxyman, find the request to `partner-identity.myq-cloud.com/connect/token`
-5. Copy the response JSON into `myq_tokens.json`
-
-The response will look like:
-```json
-{
-  "access_token": "eyJ...",
-  "refresh_token": "ABC123...",
-  "expires_in": 1800,
-  "token_type": "Bearer",
-  "scope": "MyQ_Residential offline_access"
-}
-```
-
-You'll also need to add:
-- `account_id` - Found in requests to `accounts.myq-cloud.com`
-- `device_serial` - Your garage door opener's serial number
-- `cf_cookie` - The `__cf_bm` cookie from request headers
-
-### 3. Run with Docker
+### 3. Deploy to AWS
 
 ```bash
-# Start the API server
-docker compose up -d
-
-# Check logs
-docker logs myq-api -f
-
-# Test it
-curl http://localhost:8000/status
+./deploy/deploy.sh
 ```
 
-## API Endpoints
+This is idempotent — re-run it any time to ship changes. It creates:
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | API info and available endpoints |
-| `/status` | GET | Get current door state |
-| `/open` | POST | Open the garage door |
-| `/close` | POST | Close the garage door |
-| `/toggle` | POST | Toggle door state |
-| `/devices` | GET | List all MyQ devices |
-| `/health` | GET | Health check |
+| Resource | Name | Purpose |
+|---|---|---|
+| Lambda function | `myq-api` | The API (Python 3.13, arm64) |
+| IAM role | `myq-api-role` | Read/write exactly one SSM parameter |
+| SSM parameter | `/myq/tokens` | Encrypted MyQ tokens |
+| API Gateway | `myq-api` | Public HTTPS endpoint |
 
-### Example Usage
+It prints your API URL at the end. Save it — you'll need it for Shortcuts.
+
+### 4. Log in to MyQ
 
 ```bash
-# Get door status
-curl http://your-server:8000/status
-
-# Open the door
-curl -X POST http://your-server:8000/open
-
-# Close the door
-curl -X POST http://your-server:8000/close
-
-# With API key (if configured)
-curl -H "X-API-Key: your-api-key" http://your-server:8000/status
+python -m myq.cli setup
 ```
 
-## Deployment Options
+This opens the MyQ sign-in page in your browser, waits for you to log in, then uploads the resulting tokens to AWS.
 
-### DigitalOcean (Recommended)
+**This step needs a real browser and cannot be automated.** MyQ puts Cloudflare in front of its login page, which blocks headless browsers. You log in normally; the browser then fails to open a `com.myqops://android?code=...` link — that failure is expected, and you paste that URL back into the terminal.
 
-1. Create a Droplet (512MB RAM is sufficient, ~$4/month)
-2. SSH into the server:
+You only do this once. After that the API refreshes its own tokens indefinitely.
+
+### 5. Verify
 
 ```bash
-# Install Docker
-curl -fsSL https://get.docker.com | sh
-
-# Clone the repo
-git clone https://github.com/yourusername/myq-controller.git
-cd myq-controller
-
-# Configure
-cp .env.example .env
-nano .env  # Set your API_KEY
-
-# Add your tokens
-nano myq_tokens.json  # Paste captured tokens
-
-# Start
-docker compose up -d
+curl "https://YOUR-API-URL/status?key=YOUR_API_KEY"
 ```
 
-3. Configure firewall to allow port 8000
+## API reference
 
-### Other Platforms
+Interactive docs are at `https://YOUR-API-URL/docs`.
 
-Works on any platform that supports Docker:
-- AWS EC2 / Lightsail
-- Google Cloud Run
-- Azure Container Instances
-- Raspberry Pi
-- Home server / NAS
+| Endpoint | Methods | Description |
+|---|---|---|
+| `/health` | GET | Health check — **no auth required** |
+| `/status` | GET | Full door status |
+| `/state` | GET | Bare state as plain text: `open`, `closed`, `opening`, `closing` |
+| `/open` | GET, POST | Open the door |
+| `/close` | GET, POST | Close the door |
+| `/toggle` | GET, POST | Open if closed, close if open |
+| `/doors` | GET | All garage doors and their states |
+| `/devices` | GET | All MyQ devices, raw |
+| `/admin/refresh` | POST | Force a token refresh |
+| `/admin/reset` | POST | Drop cached state |
 
-## iOS Shortcuts Setup
+### Authentication
 
-Create automations to control your garage based on location and Bluetooth:
-
-### Open Garage When Arriving Home
-
-1. **Shortcuts app** → **Automation** tab → **+**
-2. Select **Bluetooth** → Choose your car's Bluetooth → **Is Connected**
-3. Add action: **Get Contents of URL**
-   - URL: `http://your-server:8000/open`
-   - Method: POST
-4. Add **If** condition to check location (optional):
-   - Get Distance from Current Location to Home
-   - If Distance < 0.1 miles → Run the URL action
-5. Turn OFF "Ask Before Running"
-
-### Close Garage When Leaving
-
-1. Create automation triggered by **Leave** location (your home)
-2. Add action: **Get Contents of URL**
-   - URL: `http://your-server:8000/close`
-   - Method: POST
-
-## Token Auto-Capture (Optional)
-
-For a more automated token capture experience, you can run the capture proxy:
+Three interchangeable forms, so every client can use one:
 
 ```bash
-# Start the capture proxy
-docker compose --profile capture up -d
-
-# Configure your phone to use the proxy:
-# Server: your-server-ip
-# Port: 8888
-
-# Visit http://your-server-ip:8889 for setup instructions
+curl -H "X-API-Key: KEY"            https://YOUR-API-URL/status   # preferred
+curl -H "Authorization: Bearer KEY" https://YOUR-API-URL/status
+curl "https://YOUR-API-URL/status?key=KEY"                        # for Shortcuts URLs
 ```
+
+### Query parameters
+
+| Parameter | Applies to | Description |
+|---|---|---|
+| `key` | all | API key, for clients that cannot set headers |
+| `format` | most | `json` (default) or `text` |
+| `wait` | commands | `true` polls until the door finishes moving |
+| `timeout` | commands | Seconds to wait, default 25 |
+| `serial` | most | Target a specific door on multi-door accounts |
+| `force` | open/close | Send the command even if already in that state |
+
+### Examples
+
+```bash
+# Is it open? -> "closed"
+curl "https://YOUR-API-URL/state?key=KEY"
+
+# Close it and wait for confirmation -> "Garage Door is closed"
+curl "https://YOUR-API-URL/close?key=KEY&wait=true&format=text"
+
+# Fire and forget
+curl -X POST -H "X-API-Key: KEY" "https://YOUR-API-URL/open"
+```
+
+### Status codes
+
+Errors are typed so a client can tell recoverable from unrecoverable:
+
+| Code | Meaning |
+|---|---|
+| 401 | Missing or wrong API key |
+| 404 | No such garage door |
+| 409 | The opener is offline — the command would have vanished silently |
+| 429 | Rate limited |
+| 502 | MyQ is down or returned an error |
+| 503 | No API key configured, or MyQ tokens need a re-login |
+| 504 | Command sent, but the door did not reach the target state in time |
+
+## iOS Shortcuts
+
+See **[docs/SHORTCUTS.md](docs/SHORTCUTS.md)** for step-by-step setup, including Bluetooth and location-triggered automations.
+
+The short version — one action, no JSON parsing:
+
+> **Get Contents of URL** → `https://YOUR-API-URL/open?key=YOUR_KEY`
+
+## Local development
+
+```bash
+python -m myq.cli login     # get tokens locally
+python -m myq.cli serve     # run on http://localhost:8000
+python -m myq.cli test      # print door state
+python -m myq.cli open --wait
+pytest                      # test suite, no network required
+```
+
+| Command | Description |
+|---|---|
+| `myq setup` | Log in and upload tokens to AWS (first run) |
+| `myq login` | Browser login, saves tokens locally |
+| `myq push-tokens` | Upload local tokens to SSM |
+| `myq pull-tokens` | Download tokens from SSM |
+| `myq status` | Show stored token state |
+| `myq test` | Print door state from MyQ |
+| `myq serve` | Run the API locally |
+| `myq open` / `myq close` | Send a command directly |
+
+## Project layout
+
+```
+myq/
+  api.py             FastAPI app — routes, auth, rate limiting, error mapping
+  client.py          Async MyQ client — OAuth refresh, device and command calls
+  tokens.py          Token model + file/SSM storage backends
+  login.py           One-time interactive OAuth login (local only)
+  config.py          Settings
+  errors.py          Typed errors mapped to HTTP status codes
+  models.py          Response models with plain-text renderings
+  cli.py             Command line interface
+  lambda_handler.py  AWS Lambda entry point
+deploy/deploy.sh     Idempotent AWS deployment
+tools/               Optional mitmproxy token capture
+tests/               Test suite
+```
+
+## Security notes
+
+- **Set a strong `API_KEY`.** Anyone with your URL and key can open your garage. The deploy script refuses to run with a placeholder key.
+- The API key is compared in constant time, and failed attempts are rate limited per IP.
+- Tokens are stored as an SSM `SecureString`, KMS-encrypted at rest. The Lambda role can access exactly that one parameter.
+- Error responses never include upstream detail or token material; that goes to CloudWatch only.
+- `.env` and `myq_tokens.json` are gitignored. Do not commit them.
+- API Gateway has no authorizer by design — auth is the app's API key, because iOS Shortcuts cannot do SigV4 request signing.
 
 ## Troubleshooting
 
-### "Token refresh failed" Error
+**`503 MyQ authentication expired`** — the refresh token died (happens if you change your MyQ password or revoke sessions). Run `python -m myq.cli setup` again.
 
-Your refresh token has expired. You'll need to capture new tokens:
-1. Open MyQ app while Proxyman is capturing
-2. Log out and log back in
-3. Update `myq_tokens.json` with the new tokens
+**`409 The garage door opener is offline`** — the opener has lost its Wi-Fi link to MyQ. Check the MyQ app; commands sent while offline do nothing.
 
-### "Cloudflare challenge" Errors
+**`504` on `?wait=true`** — the door is slower than the timeout. Pass a larger `timeout`, but note that API Gateway caps a request at 30 seconds.
 
-MyQ uses Cloudflare protection. Make sure:
-- The `cf_cookie` in your tokens file is recent
-- You're using the official app (not automated login)
-
-### Door Not Responding
-
-1. Check the MyQ app works directly
-2. Verify your `device_serial` is correct
-3. Check API logs: `docker logs myq-api`
-
-## Architecture
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   iPhone    │────▶│  Your API   │────▶│  MyQ Cloud  │
-│  Shortcuts  │     │   Server    │     │    API      │
-└─────────────┘     └─────────────┘     └─────────────┘
-                           │
-                    ┌──────┴──────┐
-                    │ Token Store │
-                    │   (JSON)    │
-                    └─────────────┘
+**Logs:**
+```bash
+aws logs tail /aws/lambda/myq-api --since 15m --follow
 ```
 
-## Security Considerations
+## Self-hosting instead of AWS
 
-- **API Key**: Always set a strong `API_KEY` in production
-- **HTTPS**: Use a reverse proxy (nginx, Caddy) with SSL in production
-- **Firewall**: Restrict access to trusted IPs if possible
-- **Tokens**: Never commit `myq_tokens.json` to version control
-
-## Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request
+A `Dockerfile` and `docker-compose.yml` are included for running on a Pi, NAS, or VPS. Put it behind a TLS-terminating reverse proxy before exposing it — Shortcuts should not send your API key over plain HTTP.
 
 ## Disclaimer
 
-This project is not affiliated with MyQ or Chamberlain Group. Use at your own risk. The MyQ API is undocumented and may change at any time.
+Not affiliated with MyQ or Chamberlain Group. The MyQ API is undocumented and may change or break without notice. Use at your own risk.
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
