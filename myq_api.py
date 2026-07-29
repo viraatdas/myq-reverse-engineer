@@ -1,6 +1,6 @@
 """
 MyQ Garage Door API - Working Implementation
-Uses OAuth login with automatic token refresh
+Uses Playwright browser login to bypass Cloudflare + automatic token refresh
 """
 
 import json
@@ -17,12 +17,14 @@ from typing import Optional
 from dataclasses import dataclass
 import aiohttp
 from urllib.parse import parse_qs, urlsplit, urlencode
-from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-# Constants - Using Android credentials (more reliable for automated access)
+# Constants
 API_BASE = "https://devices.myq-cloud.com"
-GDO_API_BASE = "https://account-devices-gdo.myq-cloud.com"  # For door actions
+GDO_API_BASE = "https://account-devices-gdo.myq-cloud.com"
 OAUTH_BASE_URI = "https://partner-identity.myq-cloud.com"
 OAUTH_AUTHORIZE_URI = "https://partner-identity.myq-cloud.com/connect/authorize"
 OAUTH_TOKEN_URI = "https://partner-identity.myq-cloud.com/connect/token"
@@ -34,8 +36,6 @@ OAUTH_CLIENT_SECRET = base64.b64decode(OAUTH_CLIENT_SECRET_B64).decode()
 OAUTH_REDIRECT_URI = "com.myqops://android"
 MYQ_APP_ID = "D9D7B25035D549D8A3EA16A9FFB8C927D4A19B55B8944011B2670A8321BF8312"
 
-# User agents
-LOGIN_USER_AGENT = "Mozilla/5.0 (Linux; Android 11; sdk_gphone_x86) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.106 Mobile Safari/537.36"
 API_USER_AGENT = "sdk_gphone_x86/Android 11"
 APP_VERSION = "5.242.0.72704"
 
@@ -62,7 +62,7 @@ class DoorState:
     is_closed: bool
 
 
-@dataclass 
+@dataclass
 class TokenInfo:
     access_token: str
     refresh_token: str
@@ -73,23 +73,231 @@ class TokenInfo:
     token_scope: str = "MyQ_Residential offline_access"
 
 
+async def playwright_login(email: str, password: str) -> dict:
+    """
+    Login to MyQ using Playwright browser to bypass Cloudflare.
+    Returns token dict on success, raises on failure.
+    """
+    from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
+
+    code_verifier, code_challenge = generate_pkce_pair()
+
+    auth_params = {
+        'acr_values': 'unified_flow:v1  brand:myq',
+        'client_id': OAUTH_CLIENT_ID,
+        'code_challenge': code_challenge,
+        'code_challenge_method': 'S256',
+        'prompt': 'login',
+        'ui_locales': 'en-US',
+        'redirect_uri': OAUTH_REDIRECT_URI,
+        'response_type': 'code',
+        'scope': 'MyQ_Residential offline_access',
+    }
+    auth_url = f"{OAUTH_AUTHORIZE_URI}?{urlencode(auth_params)}"
+
+    print(f"[{datetime.now().isoformat()}] Launching browser for login...")
+
+    headless = os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+        )
+        stealth = Stealth()
+        await stealth.apply_stealth_async(context)
+        page = await context.new_page()
+
+        auth_code = None
+
+        # Intercept the app:// redirect to capture the auth code
+        async def handle_route(route):
+            nonlocal auth_code
+            url = route.request.url
+            if "com.myqops://" in url and "code=" in url:
+                parsed = urlsplit(url)
+                query = parse_qs(parsed.query)
+                auth_code = query.get('code', [''])[0]
+                print(f"[{datetime.now().isoformat()}] Captured auth code from redirect")
+                await route.abort()
+            else:
+                await route.continue_()
+
+        # Also watch for navigation to the app scheme
+        page.on("close", lambda: None)
+
+        try:
+            # Navigate to auth URL
+            print(f"[{datetime.now().isoformat()}] Loading login page...")
+            resp = await page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+
+            # Handle Cloudflare challenge - try to click turnstile checkbox
+            for attempt in range(15):
+                content = await page.content()
+                title = await page.title()
+                if 'Just a moment' in content or 'challenge-platform' in content or 'Verify you are human' in content:
+                    print(f"[{datetime.now().isoformat()}] Cloudflare challenge, attempting to solve... ({attempt + 1}/15)")
+                    # Try to click the Turnstile checkbox via iframe
+                    try:
+                        frames = page.frames
+                        for frame in frames:
+                            try:
+                                checkbox = await frame.query_selector('input[type="checkbox"]')
+                                if checkbox:
+                                    await checkbox.click()
+                                    print(f"[{datetime.now().isoformat()}] Clicked Turnstile checkbox")
+                                    await asyncio.sleep(3)
+                                    break
+                                # Try clicking the challenge body
+                                body = await frame.query_selector('body')
+                                if body and 'challenge' in (await frame.content()).lower():
+                                    await body.click()
+                                    await asyncio.sleep(3)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    await asyncio.sleep(3)
+                elif '429' in title:
+                    print(f"[{datetime.now().isoformat()}] Rate limited, waiting... ({attempt + 1}/15)")
+                    await asyncio.sleep(10)
+                else:
+                    break
+
+            # Wait for the login form
+            print(f"[{datetime.now().isoformat()}] Waiting for login form...")
+            try:
+                await page.wait_for_selector('input[name="Email"]', timeout=30000)
+            except Exception:
+                screenshot_path = Path(__file__).parent / "login_debug.png"
+                await page.screenshot(path=str(screenshot_path))
+                content = await page.content()
+                if 'Just a moment' in content or 'challenge' in content.lower():
+                    raise Exception(
+                        "Cloudflare is blocking requests (rate limited). "
+                        "Wait 5-10 minutes and try again, or use: python setup.py --proxy"
+                    )
+                raise Exception(f"Login form not found. Screenshot saved to {screenshot_path}")
+
+            # Fill in credentials
+            print(f"[{datetime.now().isoformat()}] Entering credentials...")
+            await page.fill('input[name="Email"]', email)
+            await page.fill('input[name="Password"]', password)
+
+            # Set up interception for the app redirect before clicking
+            await page.route("**/com.myqops://**", handle_route)
+
+            # Click Sign In
+            print(f"[{datetime.now().isoformat()}] Clicking Sign In...")
+            # Try multiple selector strategies
+            try:
+                await page.click('button:has-text("Sign In")', timeout=5000)
+            except Exception:
+                try:
+                    await page.click('input[type="submit"]', timeout=3000)
+                except Exception:
+                    await page.keyboard.press("Enter")
+
+            # Wait for the redirect - the page will navigate to com.myqops://
+            # which will either be caught by route interception or cause a navigation error
+            print(f"[{datetime.now().isoformat()}] Waiting for OAuth redirect...")
+
+            for _ in range(30):
+                if auth_code:
+                    break
+
+                # Check for error messages on the page
+                try:
+                    error_el = await page.query_selector('.validation-summary-errors, .field-validation-error')
+                    if error_el:
+                        error_text = await error_el.inner_text()
+                        if error_text.strip():
+                            raise Exception(f"Login error: {error_text.strip()}")
+                except Exception as e:
+                    if "Login error:" in str(e):
+                        raise
+
+                # Check if URL contains the auth code (browser may show error page)
+                current_url = page.url
+                if "com.myqops://" in current_url and "code=" in current_url:
+                    parsed = urlsplit(current_url)
+                    query = parse_qs(parsed.query)
+                    auth_code = query.get('code', [''])[0]
+                    break
+
+                # Check console for the redirect URL
+                await asyncio.sleep(1)
+
+            if not auth_code:
+                # Last resort: check if there's a redirect we missed
+                screenshot_path = Path(__file__).parent / "login_debug.png"
+                await page.screenshot(path=str(screenshot_path))
+                print(f"[{datetime.now().isoformat()}] Saved debug screenshot to {screenshot_path}")
+                raise Exception("Failed to capture auth code - check login_debug.png")
+
+        finally:
+            await browser.close()
+
+    # Exchange auth code for tokens using httpx (sync is fine here)
+    print(f"[{datetime.now().isoformat()}] Exchanging code for tokens...")
+    import httpx
+
+    token_data = {
+        'client_id': OAUTH_CLIENT_ID,
+        'code': auth_code,
+        'code_verifier': code_verifier,
+        'grant_type': 'authorization_code',
+        'redirect_uri': OAUTH_REDIRECT_URI,
+        'scope': 'MyQ_Residential offline_access',
+    }
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            OAUTH_TOKEN_URI,
+            data=token_data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": API_USER_AGENT,
+            },
+        )
+        if resp.status_code != 200:
+            raise Exception(f"Token exchange failed: {resp.status_code} - {resp.text}")
+        tokens = resp.json()
+
+    result = {
+        'access_token': tokens['access_token'],
+        'refresh_token': tokens.get('refresh_token', ''),
+        'expires_in': tokens.get('expires_in', 1800),
+        'scope': tokens.get('scope', 'MyQ_Residential offline_access'),
+        'code_verifier': code_verifier,
+    }
+
+    print(f"[{datetime.now().isoformat()}] Login successful!")
+    return result
+
+
 class MyQAPI:
-    """MyQ API Client with OAuth login and automatic token refresh"""
-    
-    def __init__(self, tokens_file: Path = TOKENS_FILE, proxy: str = None):
+    """MyQ API Client with Playwright login and automatic token refresh"""
+
+    def __init__(self, tokens_file: Path = TOKENS_FILE):
         self.tokens_file = tokens_file
         self.tokens: Optional[TokenInfo] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._lock = asyncio.Lock()
         self._load_tokens()
-        
+
         self._email = os.getenv("MYQ_EMAIL", "")
         self._password = os.getenv("MYQ_PASSWORD", "")
-        
-        # Optional proxy for bypassing rate limits
-        # Format: "http://user:pass@host:port" or just "http://host:port"
-        self._proxy = proxy or os.getenv("MYQ_PROXY", "")
-    
+
     def _load_tokens(self):
         """Load tokens from file"""
         if self.tokens_file.exists():
@@ -108,7 +316,7 @@ class MyQAPI:
             except Exception as e:
                 print(f"[{datetime.now().isoformat()}] Failed to load tokens: {e}")
                 self.tokens = None
-    
+
     def _save_tokens(self):
         """Save tokens to file"""
         if self.tokens:
@@ -125,35 +333,14 @@ class MyQAPI:
                 'token_scope': self.tokens.token_scope,
             }
             self.tokens_file.write_text(json.dumps(data, indent=2))
-    
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session"""
         if self._session is None or self._session.closed:
-            # Create session without default headers - we'll set them per request
             connector = aiohttp.TCPConnector(ssl=True)
             self._session = aiohttp.ClientSession(connector=connector)
         return self._session
-    
-    def _get_proxy(self) -> Optional[str]:
-        """Get proxy URL if configured"""
-        return self._proxy if self._proxy else None
-    
-    def _get_login_headers(self, extra: dict = None) -> dict:
-        """Generate headers for OAuth login flow (browser-like)"""
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Accept-Language": "en-US,en;q=0.9",
-            "User-Agent": LOGIN_USER_AGENT,
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "none",
-            "upgrade-insecure-requests": "1",
-        }
-        if extra:
-            headers.update(extra)
-        return headers
-    
+
     def _get_api_headers(self, extra: dict = None) -> dict:
         """Generate headers for API calls"""
         headers = {
@@ -168,226 +355,36 @@ class MyQAPI:
         if extra:
             headers.update(extra)
         return headers
-    
-    def _extract_cookies(self, response) -> str:
-        """Extract cookies from response headers as a cookie string"""
-        cookies = []
-        for cookie in response.cookies.values():
-            cookies.append(f"{cookie.key}={cookie.value}")
-        return "; ".join(cookies)
 
-    async def login(self, email: str = None, password: str = None, max_retries: int = 3) -> bool:
+    async def login(self, email: str = None, password: str = None) -> bool:
         """
-        Perform full OAuth login using Android client credentials.
-        Uses PKCE authorization code flow with browser-like headers.
+        Login using Playwright browser to bypass Cloudflare.
+        Falls back to token refresh if available.
         """
         email = email or self._email
         password = password or self._password
-        
+
         if not email or not password:
             raise Exception("Email and password required. Set MYQ_EMAIL and MYQ_PASSWORD environment variables.")
-        
-        print(f"[{datetime.now().isoformat()}] Starting OAuth login for {email[:3]}***...")
-        
+
+        print(f"[{datetime.now().isoformat()}] Starting login for {email[:3]}***...")
+
+        token_result = await playwright_login(email, password)
+
+        access_token = token_result['access_token']
+        refresh_token = token_result.get('refresh_token', '')
+        scope = token_result.get('scope', 'MyQ_Residential offline_access')
+
+        # Get account info
+        print(f"[{datetime.now().isoformat()}] Getting account info...")
         session = await self._get_session()
-        
-        # Generate PKCE pair
-        code_verifier, code_challenge = generate_pkce_pair()
-        
-        try:
-            # Step 1: Get authorization page with PKCE challenge
-            print(f"[{datetime.now().isoformat()}] Step 1: Getting authorization page...")
-            
-            # Build auth URL with all required params (matching hjdhjd/myq)
-            auth_params = {
-                'acr_values': 'unified_flow:v1  brand:myq',  # Note: double space is intentional
-                'client_id': OAUTH_CLIENT_ID,
-                'code_challenge': code_challenge,
-                'code_challenge_method': 'S256',
-                'prompt': 'login',
-                'ui_locales': 'en-US',
-                'redirect_uri': OAUTH_REDIRECT_URI,
-                'response_type': 'code',
-                'scope': 'MyQ_Residential offline_access',
-            }
-            
-            auth_url = f"{OAUTH_AUTHORIZE_URI}?{urlencode(auth_params)}"
-            
-            html = None
-            login_url = None
-            cookies = ""
-            
-            for attempt in range(max_retries):
-                async with session.get(
-                    auth_url,
-                    headers=self._get_login_headers(),
-                    allow_redirects=False,
-                    proxy=self._get_proxy(),
-                ) as resp:
-                    if resp.status == 429:
-                        wait_time = 60 * (attempt + 1)
-                        print(f"[{datetime.now().isoformat()}] Rate limited (429), waiting {wait_time}s... (attempt {attempt + 1}/{max_retries})")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    elif resp.status not in (200, 302):
-                        raise Exception(f"Failed to get auth page: {resp.status}")
-                    
-                    # Check if we got the expected cookies
-                    if len(resp.cookies) < 3:
-                        print(f"[{datetime.now().isoformat()}] Warning: Expected 3+ cookies, got {len(resp.cookies)}")
-                    
-                    # Follow redirect if 302
-                    if resp.status == 302:
-                        redirect_url = resp.headers.get('Location', '')
-                        if redirect_url.startswith('/'):
-                            redirect_url = f"{OAUTH_BASE_URI}{redirect_url}"
-                        
-                        cookies = self._extract_cookies(resp)
-                        
-                        async with session.get(
-                            redirect_url,
-                            headers=self._get_login_headers({"Cookie": cookies}),
-                            allow_redirects=True,
-                            proxy=self._get_proxy(),
-                        ) as redirect_resp:
-                            html = await redirect_resp.text()
-                            login_url = str(redirect_resp.url)
-                            cookies = self._extract_cookies(redirect_resp) or cookies
-                    else:
-                        html = await resp.text()
-                        login_url = str(resp.url)
-                        cookies = self._extract_cookies(resp)
-                    break
-            
-            if html is None:
-                raise Exception("Failed to get auth page after retries - rate limited by MyQ/Cloudflare")
-            
-            # Step 2: Parse login form
-            print(f"[{datetime.now().isoformat()}] Step 2: Parsing login form...")
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Check for Cloudflare challenge
-            if 'cf-browser-verification' in html or 'challenge-platform' in html:
-                raise Exception("Cloudflare browser verification required - cannot automate login")
-            
-            # Find the verification token
-            token_input = soup.find('input', {'name': '__RequestVerificationToken'})
-            if not token_input:
-                raise Exception("Login form verification token not found")
-            
-            verification_token = token_input.get('value', '')
-            
-            # Step 3: Submit login credentials
-            print(f"[{datetime.now().isoformat()}] Step 3: Submitting login credentials...")
-            
-            login_data = {
-                'Email': email,
-                'Password': password,
-                'UnifiedFlowRequested': 'True',
-                '__RequestVerificationToken': verification_token,
-                'brand': 'myq',
-            }
-            
-            async with session.post(
-                login_url,
-                data=login_data,
-                headers=self._get_login_headers({
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Cookie": cookies,
-                    "cache-control": "max-age=0",
-                    "origin": "null",
-                    "sec-fetch-site": "same-origin",
-                    "sec-fetch-user": "?1",
-                }),
-                allow_redirects=False,
-                proxy=self._get_proxy(),
-            ) as resp:
-                if resp.status not in (302, 303):
-                    error_text = await resp.text()
-                    if 'invalid' in error_text.lower() or 'incorrect' in error_text.lower():
-                        raise Exception("Invalid email or password")
-                    raise Exception(f"Login failed: {resp.status}")
-                
-                # Check for successful login (should have cookies)
-                if len(resp.cookies) < 2:
-                    raise Exception("Invalid myQ credentials - login did not return expected cookies")
-                
-                redirect_location = resp.headers.get('Location', '')
-                login_cookies = self._extract_cookies(resp)
-            
-            # Step 4: Follow redirect to get authorization code
-            print(f"[{datetime.now().isoformat()}] Step 4: Following redirect to get auth code...")
-            
-            if redirect_location.startswith('/'):
-                redirect_url = f"{OAUTH_BASE_URI}{redirect_location}"
-            else:
-                redirect_url = redirect_location
-            
-            async with session.get(
-                redirect_url,
-                headers=self._get_login_headers({
-                    "Cookie": login_cookies,
-                    "cache-control": "max-age=0",
-                    "origin": "null",
-                    "sec-fetch-site": "same-origin",
-                    "sec-fetch-user": "?1",
-                }),
-                allow_redirects=False,
-                proxy=self._get_proxy(),
-            ) as resp:
-                final_redirect = resp.headers.get('Location', '')
-            
-            # Parse the authorization code from the redirect URL
-            parsed = urlsplit(final_redirect)
-            query_params = parse_qs(parsed.query)
-            
-            auth_code = query_params.get('code', [''])[0]
-            scope = query_params.get('scope', ['MyQ_Residential offline_access'])[0]
-            
-            if not auth_code:
-                raise Exception(f"No authorization code in redirect: {final_redirect[:100]}")
-            
-            print(f"[{datetime.now().isoformat()}] Got authorization code: {auth_code[:20]}...")
-            
-            # Step 5: Exchange code for tokens
-            print(f"[{datetime.now().isoformat()}] Step 5: Exchanging code for tokens...")
-            
-            token_data = {
-                'client_id': OAUTH_CLIENT_ID,
-                'code': auth_code,
-                'code_verifier': code_verifier,
-                'grant_type': 'authorization_code',
-                'redirect_uri': OAUTH_REDIRECT_URI,
-                'scope': 'MyQ_Residential offline_access',
-            }
-            
-            async with session.post(
-                OAUTH_TOKEN_URI,
-                data=token_data,
-                headers=self._get_api_headers({
-                    "Content-Type": "application/x-www-form-urlencoded",
-                }),
-                proxy=self._get_proxy(),
-            ) as resp:
-                if resp.status != 200:
-                    error = await resp.text()
-                    raise Exception(f"Token exchange failed: {resp.status} - {error}")
-                
-                token_response = await resp.json()
-            
-            access_token = token_response['access_token']
-            refresh_token = token_response.get('refresh_token', '')
-            
-            # Step 6: Get account info
-            print(f"[{datetime.now().isoformat()}] Step 6: Getting account info...")
-            
-            async with session.get(
-                f"{API_BASE}/api/v6.2/Accounts",
-                headers=self._get_api_headers({"Authorization": f"Bearer {access_token}"}),
-            ) as resp:
-                if resp.status != 200:
-                    raise Exception(f"Failed to get accounts: {resp.status}")
-                
+        headers = self._get_api_headers({"Authorization": f"Bearer {access_token}"})
+
+        account_id = ''
+        device_serial = ''
+
+        async with session.get(f"{API_BASE}/api/v6.2/Accounts", headers=headers) as resp:
+            if resp.status == 200:
                 data = await resp.read()
                 encoding = resp.headers.get('Content-Encoding', '')
                 if encoding == 'gzip':
@@ -395,86 +392,70 @@ class MyQAPI:
                 elif encoding == 'br':
                     import brotli
                     data = brotli.decompress(data)
-                
                 accounts_data = json.loads(data.decode())
-            
-            accounts = accounts_data.get('items', [])
-            if not accounts:
-                raise Exception("No accounts found")
-            
-            account_id = accounts[0].get('id', '')
-            print(f"[{datetime.now().isoformat()}] Found account: {account_id}")
-            
-            # Step 7: Get device serial
-            print(f"[{datetime.now().isoformat()}] Step 7: Getting devices...")
-            
+                accounts = accounts_data.get('items', [])
+                if accounts:
+                    account_id = accounts[0].get('id', '')
+                    print(f"[{datetime.now().isoformat()}] Account: {account_id}")
+
+        if account_id:
             async with session.get(
-                f"{API_BASE}/api/v6.2/Accounts/{account_id}/Devices",
-                headers=self._get_api_headers({"Authorization": f"Bearer {access_token}"}),
+                f"{API_BASE}/api/v6.2/Accounts/{account_id}/Devices", headers=headers
             ) as resp:
-                data = await resp.read()
-                encoding = resp.headers.get('Content-Encoding', '')
-                if encoding == 'gzip':
-                    data = gzip.decompress(data)
-                elif encoding == 'br':
-                    import brotli
-                    data = brotli.decompress(data)
-                
-                devices_data = json.loads(data.decode())
-            
-            device_serial = ''
-            for device in devices_data.get('items', []):
-                if device.get('device_family') == 'garagedoor':
-                    device_serial = device.get('serial_number', '')
-                    print(f"[{datetime.now().isoformat()}] Found garage door: {device_serial}")
-                    break
-            
-            # Save tokens
-            self.tokens = TokenInfo(
-                access_token=access_token,
-                refresh_token=refresh_token,
-                expires_at=time.time() + token_response.get('expires_in', 1800) - 60,
-                account_id=account_id,
-                device_serial=device_serial,
-                cf_cookie=self.tokens.cf_cookie if self.tokens else '',
-                token_scope=scope,
-            )
-            self._save_tokens()
-            
-            print(f"[{datetime.now().isoformat()}] ✅ Login successful! Tokens saved.")
-            return True
-            
-        except Exception as e:
-            print(f"[{datetime.now().isoformat()}] ❌ Login failed: {e}")
-            raise
-    
+                if resp.status == 200:
+                    data = await resp.read()
+                    encoding = resp.headers.get('Content-Encoding', '')
+                    if encoding == 'gzip':
+                        data = gzip.decompress(data)
+                    elif encoding == 'br':
+                        import brotli
+                        data = brotli.decompress(data)
+                    devices_data = json.loads(data.decode())
+                    for device in devices_data.get('items', []):
+                        if device.get('device_family') == 'garagedoor':
+                            device_serial = device.get('serial_number', '')
+                            name = device.get('name', 'Unknown')
+                            print(f"[{datetime.now().isoformat()}] Garage door: {name} ({device_serial})")
+                            break
+
+        self.tokens = TokenInfo(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_at=time.time() + token_result.get('expires_in', 1800) - 60,
+            account_id=account_id,
+            device_serial=device_serial,
+            cf_cookie=self.tokens.cf_cookie if self.tokens else '',
+            token_scope=scope,
+        )
+        self._save_tokens()
+
+        print(f"[{datetime.now().isoformat()}] Login complete! Tokens saved.")
+        return True
+
     async def _refresh_token(self) -> bool:
         """Refresh the access token using refresh_token"""
         if not self.tokens or not self.tokens.refresh_token:
             return False
-        
+
         print(f"[{datetime.now().isoformat()}] Refreshing access token...")
-        
+
         session = await self._get_session()
-        
-        # Use the decoded client secret for refresh (per hjdhjd/myq)
+
         refresh_data = {
             'client_id': OAUTH_CLIENT_ID,
-            'client_secret': OAUTH_CLIENT_SECRET,  # Decoded from base64
+            'client_secret': OAUTH_CLIENT_SECRET,
             'grant_type': 'refresh_token',
             'redirect_uri': OAUTH_REDIRECT_URI,
             'refresh_token': self.tokens.refresh_token,
             'scope': self.tokens.token_scope,
         }
-        
+
         try:
             async with session.post(
                 OAUTH_TOKEN_URI,
                 data=refresh_data,
                 headers=self._get_api_headers({
                     "Content-Type": "application/x-www-form-urlencoded",
-                    "Authorization": "Bearer old-token",
-                    "isRefresh": "true",
                 }),
             ) as resp:
                 if resp.status == 200:
@@ -484,7 +465,7 @@ class MyQAPI:
                     self.tokens.expires_at = time.time() + result.get('expires_in', 1800) - 60
                     self.tokens.token_scope = result.get('scope', self.tokens.token_scope)
                     self._save_tokens()
-                    print(f"[{datetime.now().isoformat()}] Token refreshed successfully!")
+                    print(f"[{datetime.now().isoformat()}] Token refreshed!")
                     return True
                 else:
                     error = await resp.text()
@@ -493,59 +474,53 @@ class MyQAPI:
         except Exception as e:
             print(f"[{datetime.now().isoformat()}] Token refresh error: {e}")
             return False
-    
+
     async def _ensure_valid_token(self):
-        """Ensure we have a valid access token, login if needed"""
+        """Ensure we have a valid access token, refresh or re-login if needed"""
         async with self._lock:
-            # No tokens at all - try to login
             if not self.tokens:
-                print(f"[{datetime.now().isoformat()}] No tokens found, attempting login...")
-                try:
-                    await self.login()
-                except Exception as e:
+                # Try reloading from file (might have been captured by proxy)
+                self._load_tokens()
+                if not self.tokens:
                     raise Exception(
-                        f"No tokens available and login failed: {e}\n"
-                        "Please capture fresh tokens from the myQ app using a proxy like Proxyman or Charles."
+                        "No tokens available. Run: python login.py (interactive browser login) "
+                        "or python setup.py --proxy (capture from phone app)"
                     )
-                return
-            
-            # Token expires within 5 minutes - try refresh first, then login
+
+            # Token expires within 5 minutes - refresh
             if time.time() > self.tokens.expires_at - 300:
                 success = await self._refresh_token()
                 if not success:
-                    print(f"[{datetime.now().isoformat()}] Refresh failed, attempting full login...")
-                    try:
-                        await self.login()
-                    except Exception as e:
-                        raise Exception(
-                            f"Token refresh failed and re-login failed: {e}\n"
-                            "MyQ/Cloudflare may be blocking automated logins. "
-                            "Please capture fresh tokens from the myQ app."
-                        )
-    
+                    # Try reloading from file before giving up
+                    self._load_tokens()
+                    if self.tokens and time.time() < self.tokens.expires_at - 300:
+                        return
+                    raise Exception(
+                        "Token refresh failed. Run: python login.py to get fresh tokens"
+                    )
+
     async def _request(self, method: str, path: str, body: dict = None, use_gdo_host: bool = False) -> dict:
-        """Make authenticated API request"""
+        """Make authenticated API request with auto-retry on 401"""
         await self._ensure_valid_token()
-        
+
         session = await self._get_session()
         base_url = GDO_API_BASE if use_gdo_host else API_BASE
         url = f"{base_url}{path}"
-        
+
         headers = self._get_api_headers({
             'Authorization': f'Bearer {self.tokens.access_token}',
         })
-        
-        # Add Cloudflare cookie if available (needed for GDO endpoints)
+
         if use_gdo_host and self.tokens.cf_cookie:
             headers['Cookie'] = self.tokens.cf_cookie
-        
+
         kwargs = {'headers': headers}
         if body:
             kwargs['json'] = body
-        
+
         async with session.request(method, url, **kwargs) as resp:
             data = await resp.read()
-            
+
             encoding = resp.headers.get('Content-Encoding', '')
             try:
                 if encoding == 'gzip':
@@ -555,8 +530,8 @@ class MyQAPI:
                     data = brotli.decompress(data)
             except Exception:
                 pass
-            
-            # Check for new Cloudflare cookie in response
+
+            # Capture Cloudflare cookie
             set_cookie = resp.headers.get('Set-Cookie', '')
             if '__cf_bm=' in set_cookie:
                 for cookie_part in set_cookie.split(';'):
@@ -564,33 +539,40 @@ class MyQAPI:
                         self.tokens.cf_cookie = cookie_part.strip()
                         self._save_tokens()
                         break
-            
-            # Handle 401 - token might be invalid, try re-login
+
             if resp.status == 401:
-                print(f"[{datetime.now().isoformat()}] Got 401, attempting re-login...")
-                await self.login()
+                print(f"[{datetime.now().isoformat()}] 401 - refreshing and retrying...")
+                refreshed = await self._refresh_token()
+                if not refreshed:
+                    await self.login()
                 headers['Authorization'] = f'Bearer {self.tokens.access_token}'
+                kwargs['headers'] = headers
                 async with session.request(method, url, **kwargs) as retry_resp:
                     data = await retry_resp.read()
                     if retry_resp.status >= 400:
-                        raise Exception(f"API error {retry_resp.status} after re-login: {data.decode() if isinstance(data, bytes) else data}")
-                    resp = retry_resp
+                        raise Exception(f"API error {retry_resp.status} after retry")
+                    if retry_resp.status == 202:
+                        return {"status": "accepted", "code": 202}
+                    if data:
+                        text = data.decode() if isinstance(data, bytes) else data
+                        return json.loads(text) if text else {}
+                    return {}
             elif resp.status >= 400:
                 raise Exception(f"API error {resp.status}: {data.decode() if isinstance(data, bytes) else data}")
-            
+
             if resp.status == 202:
                 return {"status": "accepted", "code": 202}
-            
+
             if data:
                 text = data.decode() if isinstance(data, bytes) else data
                 return json.loads(text) if text else {}
             return {}
-    
+
     async def get_devices(self) -> list[dict]:
         """Get all devices"""
         result = await self._request('GET', f'/api/v6.2/Accounts/{self.tokens.account_id}/Devices')
         return result.get('items', [])
-    
+
     async def get_garage_door(self) -> dict:
         """Get garage door device"""
         devices = await self.get_devices()
@@ -601,13 +583,13 @@ class MyQAPI:
                     self._save_tokens()
                 return device
         raise Exception("No garage door found")
-    
+
     async def get_door_state(self) -> DoorState:
         """Get current door state"""
         door = await self.get_garage_door()
         state = door.get('state', {})
         door_state = state.get('door_state', 'unknown')
-        
+
         return DoorState(
             name=door.get('name', 'Unknown'),
             serial_number=door.get('serial_number', ''),
@@ -618,12 +600,12 @@ class MyQAPI:
             is_open=door_state in ('open', 'opening'),
             is_closed=door_state == 'closed',
         )
-    
+
     async def set_door_state(self, action: str) -> dict:
         """Set door state (open/close) using the GDO API"""
         door = await self.get_garage_door()
         serial = door['serial_number']
-        
+
         result = await self._request(
             'PUT',
             f'/api/v6.0/Accounts/{self.tokens.account_id}/door_openers/{serial}/{action}',
@@ -631,15 +613,15 @@ class MyQAPI:
             use_gdo_host=True
         )
         return result
-    
+
     async def open_door(self) -> dict:
         """Open the garage door"""
         return await self.set_door_state('open')
-    
+
     async def close_door(self) -> dict:
         """Close the garage door"""
         return await self.set_door_state('close')
-    
+
     async def close(self):
         """Close the session"""
         if self._session and not self._session.closed:

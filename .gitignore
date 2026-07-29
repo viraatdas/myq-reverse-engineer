@@ -69,3 +69,7 @@ node_modules/
 *.local
 *.bak
 
+.rudder/
+.rudder-worktrees/
+RUDDER.md
+RUDDER_SHARED.md
